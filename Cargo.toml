@@ -1,0 +1,11 @@
+[package]
+name = "indexer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "3.1.8", features = ["derive"] }
+rayon = "1.5.2"
+mp3-metadata = "0.3.3"
+metaflac = "0.2.5"
+lazy_static = "1.4.0"
