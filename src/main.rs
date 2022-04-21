@@ -1,118 +1,164 @@
-use std::fmt::Write;
-use std::{
-    ffi::OsStr,
-    fs::{self, DirEntry},
-    path::{Path, PathBuf},
-    sync::{
-        mpsc::{self, Sender},
-        Mutex,
-    },
-};
+mod file_format;
 
-lazy_static::lazy_static! {
-    static ref ULT_STRING: Mutex<Vec<String>> = Mutex::new(vec![]);
-    static ref COUNT: Mutex<usize> = Mutex::new(0);
+use indicatif::{ProgressBar, ProgressStyle};
+use serde::Serialize;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::Mutex;
+
+use uuid::Uuid;
+
+use file_format::FileFormatFactory;
+use rayon::iter::IntoParallelRefIterator;
+
+fn is_music_file(path: &PathBuf) -> bool {
+    match path.extension() {
+        None => false,
+        Some(ext) => match ext.to_str().unwrap_or("") {
+            #[cfg(feature = "m4a")]
+            "m4a" => true,
+            #[cfg(feature = "mp3")]
+            "mp3" => true,
+            #[cfg(feature = "flac")]
+            "flac" => true,
+            _ => false,
+        },
+    }
 }
 
-use clap::Parser;
-use metaflac::Tag;
-use rayon::Scope;
-
-#[derive(Parser, Debug)]
-#[clap(author, version, about, long_about = None)]
-struct Args {
-    #[clap(short, long)]
-    path: String,
-}
-
-fn get_file_info(s: &OsStr, path: &Path) -> Option<(u64, String)> {
-    let title = path
-        .with_extension("")
-        .components()
-        .last()
+/* TODO: Multithread this? */
+fn dir_list(path: &str, vec: &mut Vec<String>) {
+    std::fs::read_dir(path)
         .unwrap()
-        .as_os_str()
-        .to_str()
-        .unwrap()
-        .to_string();
-    let length = match s.to_str().unwrap() {
-        "mp3" => {
-            let metadata = match mp3_metadata::read_from_file(path) {
-                Ok(m) => m,
-                Err(e) => {
-                    eprintln!("{}", e);
-                    return None;
+        .into_iter()
+        .for_each(|entry| {
+            let info = entry.as_ref().unwrap();
+            let path = info.path();
+
+            if path.is_dir() {
+                let len = vec.len();
+                let path = path.to_str().unwrap();
+                dir_list(path, vec);
+                if vec.len() != len {
+                    let path = path.to_string();
+                    if !vec.contains(&path) {
+                        vec.push(path);
+                    }
                 }
-            };
-            metadata.duration.as_secs()
-        }
-        "flac" => {
-            let tag = Tag::read_from_path(path).unwrap();
-            let info = tag.get_streaminfo().unwrap();
-            info.total_samples / info.sample_rate as u64
-        }
-        _ => return None,
-    };
-    Some((length, title))
-}
-
-fn scan<'a, U: AsRef<Path>>(
-    src: &U,
-    tx: Sender<(Result<DirEntry, std::io::Error>, u64)>,
-    scope: &Scope<'a>,
-) {
-    let dir = fs::read_dir(src).unwrap();
-    dir.into_iter().for_each(|entry| {
-        let info = entry.as_ref().unwrap();
-        let path = info.path();
-
-        if path.is_dir() {
-            let tx = tx.clone();
-            scope.spawn(move |s| scan(&path, tx, s));
-        } else {
-            if let Some(format) = path.extension() {
-                {
-                    let mut count = COUNT.lock().unwrap();
-                    *count += 1;
-                    eprintln!("{}", count);
+            } else {
+                let path = PathBuf::from(path);
+                if is_music_file(&path) {
+                    let parent_path = path.parent().unwrap().to_str().unwrap().to_string();
+                    if !vec.contains(&parent_path) {
+                        vec.push(parent_path);
+                    }
+                    return;
                 }
-                let (length, title) = match get_file_info(format, &path) {
-                    Some(d) => d,
-                    _ => return,
-                };
-
-                let mut v = ULT_STRING.lock().unwrap();
-
-                let mut s = String::new();
-
-                write!(s, "  {{\n    \"path\": {:?},\n    \"format\": {:?},\n    \"title\": {:?},\n    \"duration\": {}\n  }}",
-                    path.parent().unwrap(),
-                    format.to_ascii_lowercase(),
-                    title,
-                    length).unwrap();
-                v.push(s);
             }
-            let size = info.metadata().unwrap().len();
-            tx.send((entry, size)).unwrap();
-        }
-    });
+        });
+}
+
+use rayon::prelude::*;
+
+#[derive(Serialize, Debug)]
+struct FileEntry {
+    folder: String,
+    name: String,
+    format: String,
+    duration: u64,
+    uuid: String,
+}
+
+#[derive(Serialize, Debug)]
+struct FileEntries {
+    folders: Vec<String>,
+    files: Vec<FileEntry>,
+}
+
+fn truncate(input: &String, len: usize) -> String {
+	if input.len() <= len {
+		return input.clone();
+	}
+	let ilen = input.len();
+	format!("{}....{}", &input[0..len / 2 - 2], &input[ilen - (len / 2 - 2) ..])
 }
 
 fn main() {
-    let args = Args::parse();
-    let source = PathBuf::from(args.path);
+    let mut folders = vec![];
+    dir_list("./", &mut folders);
 
-    let (tx, _rx) = mpsc::channel();
-
-    rayon::scope(|s| scan(&source, tx, s));
-    println!("{{");
-    let lock = ULT_STRING.lock().unwrap();
-    for (i, string) in lock.iter().enumerate() {
-        print!("{}", string);
-        if i != lock.iter().len() - 1 {
-            print!(",");
-        }
-        println!();
+    for folder in folders.iter_mut() {
+        *folder = folder.to_owned() + "/";
     }
-    println!("}}");
+
+    let entries: Mutex<Vec<FileEntry>> = Mutex::new(vec![]);
+    let bar = ProgressBar::new(folders.len() as u64);
+
+    bar.set_style(
+        ProgressStyle::default_bar()
+            .template("{wide_bar} {pos:>7}/{len:7}\n{msg}")
+            .progress_chars("##-"),
+    );
+
+    folders.par_iter().for_each(|dir| {
+        std::fs::read_dir(&dir)
+            .unwrap()
+            .into_iter()
+            .for_each(|entry| {
+                let info = entry.as_ref().unwrap();
+                let path = info.path();
+
+                if path.is_file() && is_music_file(&path) {
+                    bar.set_message(truncate(&path.to_str().unwrap().to_string(), term_size::dimensions().unwrap().0));
+                    let file = FileFormatFactory::new_file(path.as_os_str().to_str().unwrap());
+                    match file {
+                        Some(file) => match file.duration() {
+                            Ok(duration) => {
+                                let entry = FileEntry {
+                                    name: path
+                                        .with_extension("")
+                                        .components()
+                                        .last()
+                                        .unwrap()
+                                        .as_os_str()
+                                        .to_str()
+                                        .unwrap()
+                                        .to_string(),
+                                    format: file.extension().to_string(),
+                                    folder: dir.clone(),
+                                    duration: duration.as_secs(),
+                                    uuid: Uuid::new_v4().to_string().replace("-", ""),
+                                };
+                                let mut data = entries.lock().unwrap();
+                                (*data).push(entry);
+                            }
+                            Err(_) => {},
+                        },
+                        None => println!("Invalid format"),
+                    };
+                }
+            });
+        bar.inc(1);
+    });
+
+    bar.finish_and_clear();
+    folders.sort();
+
+    let final_obj = FileEntries {
+		folders,
+        files: entries.into_inner().unwrap(),
+    };
+
+	let mut final_duration: u64 = 0;
+
+	for file in &final_obj.files {
+		final_duration += file.duration;
+	}
+
+	println!("Indexed {} files", final_obj.files.len());
+	println!("Total: {} days, {} hours, {} minutes and {} seconds of music", final_duration / (3600 * 24), (final_duration / 3600) % 24, (final_duration / 60) % 60, final_duration % 60);
+
+    let json = serde_json::to_string(&final_obj).unwrap();
+
+    fs::write("index.json", json).unwrap();
 }
